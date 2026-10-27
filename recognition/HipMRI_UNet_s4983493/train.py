@@ -154,7 +154,18 @@ def main():
     parser.add_argument("--no_augment", action="store_true")
     parser.add_argument("--amp", action="store_true",
                         help="Use float16 mixed precision (recommended on T4)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for weights, shuffling and augmentation")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import random
+        import numpy as np
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"Seed: {args.seed}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -245,7 +256,7 @@ def main():
         f.write(f"Peak training VRAM: {peak_vram:.2f} GB\n")
         f.write(f"GPU: {gpu_name}\n")
         f.write(f"Batch size: {args.batch_size}, epochs: {args.epochs}, lr: {args.lr}, "
-                f"AMP: {use_amp}\n")
+                f"AMP: {use_amp}, seed: {args.seed}\n")
 
 
 if __name__ == "__main__":
