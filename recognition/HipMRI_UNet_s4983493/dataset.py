@@ -59,13 +59,32 @@ class HipMRIDataset(Dataset):
         self.transform = transform
 
         # Collect all image file paths and sort for reproducibility
-        self.image_files = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")))
-
-        if len(self.image_files) == 0:
+        all_images = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")))
+        if len(all_images) == 0:
             raise FileNotFoundError(
                 f"No .nii.gz files found in {image_dir}. "
                 f"Check that the data path is correct."
             )
+
+        # Pair images with masks up front by exact name (case_X -> seg_X),
+        # so a missing mask is reported here instead of crashing mid-epoch.
+        # Slice numbers need not be contiguous; only the names must match.
+        existing_masks = {os.path.basename(p)
+                          for p in glob.glob(os.path.join(mask_dir, "*.nii.gz"))}
+        self.image_files = []
+        unmatched = []
+        for p in all_images:
+            if os.path.basename(self._get_mask_path(p)) in existing_masks:
+                self.image_files.append(p)
+            else:
+                unmatched.append(os.path.basename(p))
+        if unmatched:
+            print(f"[HipMRIDataset] WARNING: {len(unmatched)} images in "
+                  f"{image_dir} have no matching mask and are skipped, e.g. "
+                  f"{unmatched[:3]}")
+        if len(existing_masks) > len(self.image_files):
+            print(f"[HipMRIDataset] WARNING: {len(existing_masks) - len(self.image_files)} "
+                  f"masks in {mask_dir} have no matching image")
 
     def __len__(self) -> int:
         return len(self.image_files)

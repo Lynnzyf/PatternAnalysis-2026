@@ -33,23 +33,32 @@ from dataset import get_dataloaders, NUM_CLASSES
 
 
 def train_one_epoch(model: nn.Module, loader, criterion, optimiser,
-                    device: torch.device) -> float:
-    """Train for one epoch. Returns average training loss."""
+                    device: torch.device, scaler: torch.amp.GradScaler,
+                    use_amp: bool) -> float:
+    """Train for one epoch. Returns average training loss.
+
+    With use_amp, the forward pass runs in float16 autocast (large speed-up
+    on tensor-core GPUs such as the T4); GradScaler prevents fp16 gradient
+    underflow.
+    """
     model.train()
     running_loss = 0.0
     for images, masks in loader:
-        images, masks = images.to(device), masks.to(device)
-        optimiser.zero_grad()
-        loss = criterion(model(images), masks)
-        loss.backward()
-        optimiser.step()
+        images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+        optimiser.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            loss = criterion(model(images), masks)
+        scaler.scale(loss).backward()
+        scaler.step(optimiser)
+        scaler.update()
         running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
 
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader, criterion, device: torch.device,
-             num_classes: int, prostate_label: int) -> tuple[float, dict]:
+             num_classes: int, prostate_label: int,
+             use_amp: bool = False) -> tuple[float, dict]:
     """Evaluate on a whole split.
 
     Returns:
@@ -69,8 +78,10 @@ def evaluate(model: nn.Module, loader, criterion, device: torch.device,
 
     for images, masks in loader:
         images, masks = images.to(device), masks.to(device)
-        logits = model(images)
-        running_loss += criterion(logits, masks).item() * images.size(0)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(images)
+            running_loss += criterion(logits, masks).item() * images.size(0)
+        logits = logits.float()
 
         i, p, t = dice_counts(logits, masks, num_classes)
         inter += i
@@ -141,11 +152,14 @@ def main():
                         help="Label value of the prostate in the masks")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--no_augment", action="store_true")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use float16 mixed precision (recommended on T4)")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
+    print(f"Using device: {device} ({gpu_name})")
 
     train_loader, val_loader, test_loader = get_dataloaders(
         args.data_root, args.batch_size, args.num_workers, augment=not args.no_augment)
@@ -160,6 +174,10 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="max", factor=0.5, patience=5)
 
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    print(f"Mixed precision: {use_amp}")
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
@@ -169,9 +187,10 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
-        train_loss = train_one_epoch(model, train_loader, criterion, optimiser, device)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimiser,
+                                     device, scaler, use_amp)
         val_loss, val_m = evaluate(model, val_loader, criterion, device,
-                                   NUM_CLASSES, args.prostate_label)
+                                   NUM_CLASSES, args.prostate_label, use_amp)
         scheduler.step(val_m["prostate_dice"])
 
         train_losses.append(train_loss)
@@ -207,7 +226,7 @@ def main():
                             map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, test_m = evaluate(model, test_loader, criterion, device,
-                                 NUM_CLASSES, args.prostate_label)
+                                 NUM_CLASSES, args.prostate_label, use_amp)
     print(f"\n--- Test --- Loss {test_loss:.4f} | {format_metrics(test_m)}")
 
     with open(os.path.join(args.save_dir, "test_results.txt"), "w") as f:
@@ -224,6 +243,9 @@ def main():
         f.write(f"Parameters: {total_params:,}\n")
         f.write(f"Training time: {total_time / 60:.1f} min\n")
         f.write(f"Peak training VRAM: {peak_vram:.2f} GB\n")
+        f.write(f"GPU: {gpu_name}\n")
+        f.write(f"Batch size: {args.batch_size}, epochs: {args.epochs}, lr: {args.lr}, "
+                f"AMP: {use_amp}\n")
 
 
 if __name__ == "__main__":
