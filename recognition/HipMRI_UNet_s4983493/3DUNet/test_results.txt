@@ -1,15 +1,16 @@
-3D Improved U-Net — native-resolution test results (9 volumes)
-  0 Background 0.9943
-  1 Body       0.9756
-  2 Bone       0.8776
-  3 Bladder    0.9459
-  4 Rectum     0.7954
-  5 Prostate   0.8390
-Prostate Dice (global): 0.8390
-Prostate Dice per volume: mean 0.8357, std 0.0420, min 0.7510
-Base slices (k=2): mean Dice 0.6821, missed 0/18
-Apex slices (k=2): mean Dice 0.6716, missed 3/18
-Inner slices: mean Dice 0.8457
-False-positive slices (total): 27
-Latency: 30.0 ms/volume (fp32, batch 1, incl. upsampling)
-Peak inference VRAM: 1.28 GB
+3D Improved U-Net — test results on the resampled grid (native-resolution results: predict.py)
+Best epoch: 24
+Best val prostate Dice: 0.8476
+Test prostate Dice (global): 0.8859
+Test prostate Dice (per-volume mean / min): 0.8817 / 0.8444
+  class 0: 0.9978
+  class 1: 0.9863
+  class 2: 0.9190
+  class 3: 0.9612
+  class 4: 0.8359
+  class 5: 0.8859
+Parameters: 9,462,242
+Training time: 37.9 min
+Peak training VRAM: 14.69 GB
+GPU: NVIDIA A100-SXM4-80GB
+Batch size: 2, lr: 0.0005, AMP: torch.bfloat16, seed: 1, target shape: [128, 256, 256]

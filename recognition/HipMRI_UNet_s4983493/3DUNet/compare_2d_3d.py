@@ -38,6 +38,23 @@ from predict import edge_analysis, error_overlay
 SHAPE_2D = (256, 128)
 
 
+def keep_largest(pred: np.ndarray, label: int) -> np.ndarray:
+    """Post-processing: keep only the largest 3D connected component of `label`.
+
+    Removed voxels become background. Used to test how much of each model's
+    error is isolated false-positive specks.
+    """
+    from scipy import ndimage
+    m = pred == label
+    comp, n = ndimage.label(m)
+    if n <= 1:
+        return pred
+    sizes = ndimage.sum(m, comp, range(1, n + 1))
+    out = pred.copy()
+    out[m & (comp != int(np.argmax(sizes)) + 1)] = 0
+    return out
+
+
 def load_2d_model(code_dir, ckpt_path, device):
     spec = importlib.util.spec_from_file_location("modules2d", os.path.join(code_dir, "modules.py"))
     mod = importlib.util.module_from_spec(spec)
@@ -102,7 +119,9 @@ def main():
 
         r2 = edge_analysis(pred2d, gt, label, k=args.edge_k)
         r3 = edge_analysis(pred3d, gt, label, k=args.edge_k)
-        rows.append((meta, r2, r3))
+        r2l = edge_analysis(keep_largest(pred2d, label), gt, label, k=args.edge_k)
+        r3l = edge_analysis(keep_largest(pred3d, label), gt, label, k=args.edge_k)
+        rows.append((meta, r2, r3, r2l, r3l))
         for which in ("base", "apex"):
             for z in r2[which]:
                 worst.append((r2["slice_dice"][z] - r3["slice_dice"][z], r2["slice_dice"][z],
@@ -123,16 +142,21 @@ def main():
                 f"(missed {s('apex_missed')}/{n_edge}) | inner {m('inner_dice'):.4f} | "
                 f"FP slices {s('fp_slices')}")
 
-    patients = sorted({meta["patient"] for meta, _, _ in rows})
-    per_patient = []
+    patients = sorted({r[0]["patient"] for r in rows})
+    per_patient, patient_means = [], []
     for p in patients:
-        sel = [(r2["volume_dice"], r3["volume_dice"]) for meta, r2, r3 in rows if meta["patient"] == p]
-        a = np.array(sel)
-        per_patient.append(f"  {p}: {len(sel)} volumes, 2D {a[:, 0].mean():.4f}, 3D {a[:, 1].mean():.4f}")
+        a = np.array([(r[1]["volume_dice"], r[2]["volume_dice"]) for r in rows
+                      if r[0]["patient"] == p])
+        patient_means.append(a.mean(axis=0))
+        per_patient.append(f"  {p}: {len(a)} volumes, 2D {a[:, 0].mean():.4f}, 3D {a[:, 1].mean():.4f}")
+    pm = np.array(patient_means).mean(axis=0)
+    per_patient.append(f"  mean of patient means: 2D {pm[0]:.4f}, 3D {pm[1]:.4f}")
 
     lines = [f"2D vs 3D on {len(rows)} test volumes (native resolution, edge k={args.edge_k})",
              summary(1, "2D U-Net "), summary(2, "3D Imp. U-Net"),
-             "Per patient (mean volume Dice):", *per_patient,
+             "After keeping the largest connected prostate component:",
+             summary(3, "2D U-Net  + LCC"), summary(4, "3D Imp. U-Net + LCC"),
+             "Per patient (mean volume Dice, raw):", *per_patient,
              f"2D latency: {np.mean(lat):.1f} ms/volume (all coronal slices, fp32)"]
     print("\n" + "\n".join(lines))
     with open(os.path.join(args.save_dir, "comparison.txt"), "w") as f:

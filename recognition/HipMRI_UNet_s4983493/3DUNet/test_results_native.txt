@@ -1,0 +1,15 @@
+3D Improved U-Net — native-resolution test results (9 volumes)
+  0 Background 0.9978
+  1 Body       0.9863
+  2 Bone       0.9190
+  3 Bladder    0.9612
+  4 Rectum     0.8360
+  5 Prostate   0.8861
+Prostate Dice (global): 0.8861
+Prostate Dice per volume: mean 0.8819, std 0.0205, min 0.8449
+Base slices (k=2): mean Dice 0.8190, missed 0/18
+Apex slices (k=2): mean Dice 0.6977, missed 1/18
+Inner slices: mean Dice 0.8902
+False-positive slices (total): 32
+Latency: 101.9 ms/volume (fp32, batch 1, incl. upsampling)
+Peak inference VRAM: 4.17 GB
