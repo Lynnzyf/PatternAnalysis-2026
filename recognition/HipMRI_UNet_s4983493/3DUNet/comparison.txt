@@ -1,0 +1,8 @@
+2D vs 3D on 9 test volumes (native resolution, edge k=2)
+2D U-Net : volume Dice 0.8384 | base 0.7850 (missed 0/18) | apex 0.6452 (missed 1/18) | inner 0.8722 | FP slices 334
+3D Imp. U-Net: volume Dice 0.8357 | base 0.6821 (missed 0/18) | apex 0.6716 (missed 3/18) | inner 0.8457 | FP slices 27
+Per patient (mean volume Dice):
+  B040: 7 volumes, 2D 0.8355, 3D 0.8363
+  K042: 1 volumes, 2D 0.8450, 3D 0.8293
+  W041: 1 volumes, 2D 0.8524, 3D 0.8375
+2D latency: 268.2 ms/volume (all coronal slices, fp32)
