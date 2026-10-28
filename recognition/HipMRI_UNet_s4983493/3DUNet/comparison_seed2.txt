@@ -1,0 +1,12 @@
+2D vs 3D on 9 test volumes (native resolution, edge k=2)
+2D U-Net : volume Dice 0.7261 | base 0.7014 (missed 0/18) | apex 0.5914 (missed 2/18) | inner 0.8532 | FP slices 429
+3D Imp. U-Net: volume Dice 0.8940 | base 0.7786 (missed 0/18) | apex 0.6400 (missed 4/18) | inner 0.8934 | FP slices 20
+After keeping the largest connected prostate component:
+2D U-Net  + LCC: volume Dice 0.8682 | base 0.7557 (missed 0/18) | apex 0.6739 (missed 3/18) | inner 0.8759 | FP slices 33
+3D Imp. U-Net + LCC: volume Dice 0.8940 | base 0.7786 (missed 0/18) | apex 0.6400 (missed 4/18) | inner 0.8934 | FP slices 20
+Per patient (mean volume Dice, raw):
+  B040: 7 volumes, 2D 0.7063, 3D 0.8997
+  K042: 1 volumes, 2D 0.7140, 3D 0.8567
+  W041: 1 volumes, 2D 0.8773, 3D 0.8918
+  mean of patient means: 2D 0.7659, 3D 0.8827
+2D latency: 271.0 ms/volume (all coronal slices, fp32)
