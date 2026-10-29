@@ -1,5 +1,11 @@
-checkpoints/
-predictions/
+checkpoints*/
+predictions*/
+comparison*/
+cache*/
 *.pth
+*.pt
+*.npz
+*.nii
 *.nii.gz
 *.tar.gz
+__pycache__/

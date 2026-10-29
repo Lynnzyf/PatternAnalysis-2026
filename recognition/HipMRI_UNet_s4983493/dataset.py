@@ -1,216 +1,259 @@
 """
-dataset.py — HipMRI 2D Slice Data Loader
+dataset.py — data loading for HipMRI prostate segmentation (2D slices and 3D volumes)
 
-Loads 2D MRI slices and corresponding segmentation masks from .nii.gz files.
-Handles the filename prefix mismatch: images use 'case_' prefix, masks use 'seg_'.
+Labels (audited over every mask, both datasets): 0 background, 1 body, 2 bone,
+3 bladder, 4 rectum, 5 prostate. The prostate is ~0.1-0.5% of voxels.
 
-Data structure on disk:
-    keras_slices_train/       case_004_week_0_slice_0.nii.gz, ...
-    keras_slices_seg_train/   seg_004_week_0_slice_0.nii.gz, ...
-    keras_slices_validate/    (same pattern)
-    keras_slices_seg_validate/
-    keras_slices_test/
-    keras_slices_seg_test/
+2D data (keras_slices_data)
+  keras_slices_{train,validate,test}/      case_004_week_0_slice_0.nii.gz ...
+  keras_slices_seg_{train,validate,test}/  seg_004_week_0_slice_0.nii.gz ...
+  - 11460 / 660 / 540 slices; every volume contributes exactly 60 slices
+  - The slices are CORONAL slices (left-right x superior-inferior) of the 3D
+    volumes below, covering a ~10 cm anterior-posterior slab around the
+    prostate (verified by image correlation with patient 040)
+  - Shape 256x128 (one volume 256x144, resized to 256x128)
 
-Data audit (run over every mask file):
-    - Slices: train 1545 / validate 660 / test 540
-    - Segmentation labels: {0, 1, 2, 3, 4, 5} — 6 classes, all kept
-    - Prostate label (default 5) covers ~0.3–0.5% of pixels and appears in
-      only ~35% of slices -> severe class imbalance
-    - Patient-level split verified: no case ID is shared between
-      train / validate / test
+3D data (semantic_MRs / semantic_labels_only)
+  B040_Week0_LFOV.nii.gz / B040_Week0_SEMANTIC.nii.gz ...
+  - 211 volumes, 38 patients, 256x256x128 (one 256x256x144)
+  - Loaded as (D, H, W) = (Z, X, Y): D superior-inferior (axial slices),
+    H left-right, W anterior-posterior
+
+Split (both datasets, patient level): the 2D dataset's provided split is
+used, and the 3D split mirrors it (validation = patients 36-39, test = 40-42),
+verified to share no patient between splits. So the 2D model never sees a 3D
+test patient, and every weekly scan of a patient stays in one split.
+
+NumPy is used here only for loading and augmentation (allowed outside
+modules.py).
 """
 
-import os
 import glob
+import os
 import re
-from typing import Optional, Callable
 
+import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# nibabel is used only for loading .nii.gz files in the dataset loader,
-# not in the model itself (modules.py is pure PyTorch)
-import nibabel as nib
-
 NUM_CLASSES = 6
-TARGET_SHAPE = (256, 128)
+PROSTATE_LABEL = 5
+BLADDER_LABEL = 3
 
-_NAME_RE = re.compile(r"case_(\d+)_week_(\d+)_slice_(\d+)")
+
+# ===========================================================================
+# 2D coronal slices
+# ===========================================================================
+
+SHAPE_2D = (256, 128)
+_SLICE_RE = re.compile(r"case_(\d+)_week_(\d+)_slice_(\d+)")
 
 
-class HipMRIDataset(Dataset):
-    """PyTorch Dataset for HipMRI 2D slices.
+class HipMRI2DDataset(Dataset):
+    """2D slices paired with masks by name (case_X... -> seg_X...).
 
-    Pairs each image slice with its segmentation mask by converting the
-    filename prefix from 'case_' to 'seg_'.
-
-    Args:
-        image_dir: Path to directory containing image .nii.gz files
-        mask_dir: Path to directory containing segmentation .nii.gz files
-        transform: Optional callable for data augmentation on (image, mask) pairs
+    Each item: image (1, 256, 128) float32, z-scored per slice;
+    mask (256, 128) long.
     """
 
-    def __init__(self, image_dir: str, mask_dir: str,
-                 transform: Optional[Callable] = None):
-        self.image_dir = image_dir
+    def __init__(self, image_dir: str, mask_dir: str, transform=None):
         self.mask_dir = mask_dir
         self.transform = transform
+        images = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")))
+        if not images:
+            raise FileNotFoundError(f"No .nii.gz files in {image_dir}")
+        masks = {os.path.basename(p) for p in glob.glob(os.path.join(mask_dir, "*.nii.gz"))}
+        self.image_files = [p for p in images
+                            if os.path.basename(self._mask_path(p)) in masks]
+        skipped = len(images) - len(self.image_files)
+        if skipped:
+            print(f"[dataset] WARNING: {skipped} images in {image_dir} have no mask "
+                  f"and are skipped")
+        if len(masks) > len(self.image_files):
+            print(f"[dataset] WARNING: {len(masks) - len(self.image_files)} masks in "
+                  f"{mask_dir} have no image")
 
-        # Collect all image file paths and sort for reproducibility
-        all_images = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")))
-        if len(all_images) == 0:
-            raise FileNotFoundError(
-                f"No .nii.gz files found in {image_dir}. "
-                f"Check that the data path is correct."
-            )
-
-        # Pair images with masks up front by exact name (case_X -> seg_X),
-        # so a missing mask is reported here instead of crashing mid-epoch.
-        # Slice numbers need not be contiguous; only the names must match.
-        existing_masks = {os.path.basename(p)
-                          for p in glob.glob(os.path.join(mask_dir, "*.nii.gz"))}
-        self.image_files = []
-        unmatched = []
-        for p in all_images:
-            if os.path.basename(self._get_mask_path(p)) in existing_masks:
-                self.image_files.append(p)
-            else:
-                unmatched.append(os.path.basename(p))
-        if unmatched:
-            print(f"[HipMRIDataset] WARNING: {len(unmatched)} images in "
-                  f"{image_dir} have no matching mask and are skipped, e.g. "
-                  f"{unmatched[:3]}")
-        if len(existing_masks) > len(self.image_files):
-            print(f"[HipMRIDataset] WARNING: {len(existing_masks) - len(self.image_files)} "
-                  f"masks in {mask_dir} have no matching image")
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.image_files)
 
-    def get_meta(self, idx: int) -> dict:
-        """Parse (case, week, slice index) from the filename.
-
-        Used later to rebuild each scan's slice order, so that base/apex
-        (first/last prostate-containing) slices can be analysed separately.
-        """
-        m = _NAME_RE.search(os.path.basename(self.image_files[idx]))
-        if m is None:
-            return {"case": None, "week": None, "slice": None}
-        return {"case": int(m.group(1)), "week": int(m.group(2)),
-                "slice": int(m.group(3))}
-
-    def _get_mask_path(self, image_path: str) -> str:
-        """Convert image filename to corresponding mask filename.
-
-        Image files:  case_004_week_0_slice_0.nii.gz
-        Mask files:   seg_004_week_0_slice_0.nii.gz
-        """
-        basename = os.path.basename(image_path)
-        suffix = basename.split("case_", 1)[1]
+    def _mask_path(self, image_path):
+        suffix = os.path.basename(image_path).split("case_", 1)[1]
         return os.path.join(self.mask_dir, f"seg_{suffix}")
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Load one image-mask pair.
+    def get_meta(self, idx: int) -> dict:
+        """(case, week, slice) parsed from the filename."""
+        m = _SLICE_RE.search(os.path.basename(self.image_files[idx]))
+        if m is None:
+            return {"case": None, "week": None, "slice": None}
+        return {"case": int(m.group(1)), "week": int(m.group(2)), "slice": int(m.group(3))}
 
-        Returns:
-            image: (1, H, W) float32 tensor, intensity-normalised
-            mask:  (H, W) long tensor with integer class labels {0..5}
-        """
-        image_path = self.image_files[idx]
-        mask_path = self._get_mask_path(image_path)
-
-        image = nib.load(image_path).get_fdata().astype("float32")  # (H, W)
-        mask = nib.load(mask_path).get_fdata().astype("float32")
-        # NOTE: an earlier version mapped labels 4 and 5 to background here,
-        # which silently removed the prostate from training. All 6 labels
-        # are now kept.
-
+    def __getitem__(self, idx):
+        path = self.image_files[idx]
+        image = nib.load(path).get_fdata().astype(np.float32)
+        mask = nib.load(self._mask_path(path)).get_fdata().astype(np.float32)
         if self.transform is not None:
             image, mask = self.transform(image, mask)
 
-        image_tensor = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0)
-        mask_tensor = torch.from_numpy(np.ascontiguousarray(mask)).long()
-
-        # Resize to fixed size if needed (some slices are 256x144)
-        if tuple(image_tensor.shape[-2:]) != TARGET_SHAPE:
-            image_tensor = torch.nn.functional.interpolate(
-                image_tensor.unsqueeze(0), size=TARGET_SHAPE,
-                mode="bilinear", align_corners=False
-            ).squeeze(0)
-            mask_tensor = torch.nn.functional.interpolate(
-                mask_tensor.float().unsqueeze(0).unsqueeze(0), size=TARGET_SHAPE,
-                mode="nearest"
-            ).long().squeeze(0).squeeze(0)
-
-        # Intensity normalisation: zero-mean, unit-variance per slice
-        mean = image_tensor.mean()
-        std = image_tensor.std()
+        image = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0)
+        mask = torch.from_numpy(np.ascontiguousarray(mask)).long()
+        if tuple(image.shape[-2:]) != SHAPE_2D:
+            image = F.interpolate(image[None], size=SHAPE_2D, mode="bilinear",
+                                  align_corners=False)[0]
+            mask = F.interpolate(mask[None, None].float(), size=SHAPE_2D,
+                                 mode="nearest").long()[0, 0]
+        std = image.std()
         if std > 0:
-            image_tensor = (image_tensor - mean) / std
+            image = (image - image.mean()) / std
+        return image, mask
 
-        return image_tensor, mask_tensor
 
+class RandomFlip2D:
+    """Left-right mirror flip only (axis 0 of a coronal slice is left-right).
 
-class RandomAugmentation:
-    """Anatomically plausible augmentation for pelvic MRI slices.
-
-    Only a left-right mirror flip is used. Vertical flips and 180° rotations
-    (used in an earlier version) are removed because they create impossible
-    anatomy (e.g. rectum anterior to the bladder).
-
-    Args:
-        flip_prob: Probability of applying the left-right flip
-        lr_axis: Array axis corresponding to the patient's left-right
-            direction. In nibabel's (x, y) ordering x is usually left-right,
-            i.e. axis 0 — verify visually before relying on this.
+    Vertical flips / 180-degree rotations are not used: they produce
+    anatomically impossible images.
     """
 
-    def __init__(self, flip_prob: float = 0.5, lr_axis: int = 0):
-        self.flip_prob = flip_prob
-        self.lr_axis = lr_axis
+    def __init__(self, p: float = 0.5, lr_axis: int = 0):
+        self.p, self.lr_axis = p, lr_axis
 
     def __call__(self, image, mask):
-        if np.random.random() < self.flip_prob:
+        if np.random.random() < self.p:
             image = np.flip(image, axis=self.lr_axis).copy()
             mask = np.flip(mask, axis=self.lr_axis).copy()
         return image, mask
 
 
-def get_dataloaders(data_root: str, batch_size: int = 8,
-                    num_workers: int = 4, augment: bool = True
-                    ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create train, validation, and test DataLoaders.
+def get_dataloaders_2d(data_root, batch_size=16, num_workers=2, augment=True):
+    ds = lambda split, tf: HipMRI2DDataset(
+        os.path.join(data_root, f"keras_slices_{split}"),
+        os.path.join(data_root, f"keras_slices_seg_{split}"), transform=tf)
+    train_ds = ds("train", RandomFlip2D() if augment else None)
+    val_ds, test_ds = ds("validate", None), ds("test", None)
+    print(f"[dataset] 2D slices — train {len(train_ds)}, val {len(val_ds)}, test {len(test_ds)}")
+    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    return (DataLoader(train_ds, shuffle=True, drop_last=True, **kw),
+            DataLoader(val_ds, shuffle=False, **kw),
+            DataLoader(test_ds, shuffle=False, **kw))
 
-    Uses the provided patient-level train/validate/test directories
-    (verified to share no case IDs).
+
+# ===========================================================================
+# 3D volumes
+# ===========================================================================
+
+SHAPE_3D = (128, 256, 256)               # native grid (D, H, W)
+VAL_PATIENTS = {36, 37, 38, 39}          # same patients as keras_slices_validate
+TEST_PATIENTS = {40, 41, 42}             # same patients as keras_slices_test
+_VOLUME_RE = re.compile(r"([A-Za-z]+)(\d+)_Week(\d+)")
+
+
+def parse_name_3d(path: str):
+    """'B040_Week3_LFOV.nii.gz' -> {'patient': 'B040', 'number': 40, 'week': 3, 'name': 'B040_Week3'}."""
+    m = _VOLUME_RE.match(os.path.basename(path))
+    if m is None:
+        return None
+    return {"patient": m.group(1) + m.group(2), "number": int(m.group(2)),
+            "week": int(m.group(3)), "name": os.path.basename(path).split("_LFOV")[0]}
+
+
+def get_splits_3d(image_dir: str, mask_dir: str) -> dict:
+    """Patient-level split mirroring the 2D dataset: {split: [(image, mask, meta), ...]}."""
+    splits = {"train": [], "validate": [], "test": []}
+    for img in sorted(glob.glob(os.path.join(image_dir, "*.nii.gz"))):
+        meta = parse_name_3d(img)
+        if meta is None:
+            print(f"[dataset] WARNING: cannot parse {os.path.basename(img)}, skipped")
+            continue
+        mask = os.path.join(mask_dir, os.path.basename(img).replace("_LFOV", "_SEMANTIC"))
+        if not os.path.exists(mask):
+            print(f"[dataset] WARNING: no mask for {os.path.basename(img)}, skipped")
+            continue
+        n = meta["number"]
+        key = "test" if n in TEST_PATIENTS else "validate" if n in VAL_PATIENTS else "train"
+        splits[key].append((img, mask, meta))
+    for key, items in splits.items():
+        patients = {m["patient"] for _, _, m in items}
+        print(f"[dataset] 3D {key}: {len(items)} volumes, {len(patients)} patients")
+    return splits
+
+
+def load_volume_3d(path: str) -> np.ndarray:
+    """Load a NIfTI volume and reorder (X, Y, Z) -> (Z, X, Y) = (D, H, W)."""
+    return np.ascontiguousarray(
+        np.transpose(np.asarray(nib.load(path).dataobj, dtype=np.float32), (2, 0, 1)))
+
+
+def preprocess_3d(image_path: str, mask_path: str, target_shape=SHAPE_3D):
+    """Resample to target_shape and z-score; returns image float16, mask uint8."""
+    image = torch.from_numpy(load_volume_3d(image_path))[None, None]
+    mask = torch.from_numpy(load_volume_3d(mask_path))[None, None]
+    if tuple(image.shape[2:]) != tuple(target_shape):
+        image = F.interpolate(image, size=target_shape, mode="trilinear", align_corners=False)
+        mask = F.interpolate(mask, size=target_shape, mode="nearest")
+    image, mask = image[0, 0], mask[0, 0]
+    image = (image - image.mean()) / image.std().clamp(min=1e-6)
+    return image.half(), mask.round().to(torch.uint8)
+
+
+class HipMRI3DDataset(Dataset):
+    """3D volumes with an optional on-disk cache of the preprocessed tensors.
+
+    Each item: image (1, D, H, W) float32, mask (D, H, W) long.
+    Augmentation: left-right flip (axis 1 = H) and mild intensity scale /
+    shift / noise. No superior-inferior or anterior-posterior flips (they would
+    swap base and apex or put the rectum in front of the bladder).
     """
-    train_transform = RandomAugmentation() if augment else None
 
-    train_dataset = HipMRIDataset(
-        os.path.join(data_root, "keras_slices_train"),
-        os.path.join(data_root, "keras_slices_seg_train"),
-        transform=train_transform,
-    )
-    val_dataset = HipMRIDataset(
-        os.path.join(data_root, "keras_slices_validate"),
-        os.path.join(data_root, "keras_slices_seg_validate"),
-    )
-    test_dataset = HipMRIDataset(
-        os.path.join(data_root, "keras_slices_test"),
-        os.path.join(data_root, "keras_slices_seg_test"),
-    )
+    def __init__(self, pairs, target_shape=SHAPE_3D, cache_dir=None, augment=False,
+                 lr_axis=1):
+        self.pairs = pairs
+        self.target_shape = tuple(target_shape)
+        self.cache_dir = cache_dir
+        self.augment = augment
+        self.lr_axis = lr_axis
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True,
-                              drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=True)
+    def __len__(self):
+        return len(self.pairs)
 
-    print(f"Dataset sizes — Train: {len(train_dataset)}, "
-          f"Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    def _load(self, idx):
+        image_path, mask_path, _ = self.pairs[idx]
+        cache = None
+        if self.cache_dir:
+            tag = "x".join(map(str, self.target_shape))
+            cache = os.path.join(self.cache_dir, os.path.basename(image_path)
+                                 .replace(".nii.gz", f"_{tag}.pt"))
+            if os.path.exists(cache):
+                d = torch.load(cache)
+                return d["image"], d["mask"]
+        image, mask = preprocess_3d(image_path, mask_path, self.target_shape)
+        if cache:
+            torch.save({"image": image, "mask": mask}, cache)
+        return image, mask
 
-    return train_loader, val_loader, test_loader
+    def __getitem__(self, idx):
+        image, mask = self._load(idx)
+        image, mask = image.float(), mask.long()
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                image, mask = image.flip(self.lr_axis), mask.flip(self.lr_axis)
+            if torch.rand(1).item() < 0.5:
+                image = image * torch.empty(1).uniform_(0.9, 1.1) \
+                    + torch.empty(1).uniform_(-0.1, 0.1)
+            if torch.rand(1).item() < 0.3:
+                image = image + 0.05 * torch.randn_like(image)
+        return image.unsqueeze(0), mask
+
+
+def get_dataloaders_3d(image_dir, mask_dir, batch_size=2, num_workers=2, augment=True,
+                       target_shape=SHAPE_3D, cache_dir=None):
+    splits = get_splits_3d(image_dir, mask_dir)
+    ds = lambda key, aug: HipMRI3DDataset(splits[key], target_shape, cache_dir, augment=aug)
+    kw = dict(num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0)
+    return (DataLoader(ds("train", augment), batch_size=batch_size, shuffle=True,
+                       drop_last=True, **kw),
+            DataLoader(ds("validate", False), batch_size=1, shuffle=False, **kw),
+            DataLoader(ds("test", False), batch_size=1, shuffle=False, **kw))
