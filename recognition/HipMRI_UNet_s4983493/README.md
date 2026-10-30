@@ -67,17 +67,15 @@ The user is a radiotherapy planner who corrects automatic prostate contours. The
 
 ## 4. Dependencies and Reproducibility
 
-> **TODO (fill in before submission):** exact versions from the training environment, e.g. run
-> `!python -c "import sys, torch, numpy, nibabel, matplotlib, scipy; print(sys.version, torch.__version__, torch.version.cuda, numpy.__version__, nibabel.__version__, matplotlib.__version__, scipy.__version__)"` in Colab.
-
 | Package | Version |
 |---|---|
-| Python | TODO |
-| PyTorch (CUDA) | TODO |
-| NumPy | TODO |
-| nibabel | TODO |
-| matplotlib | TODO |
-| SciPy (only for the connected-component post-processing) | TODO |
+| Python | 3.13.18 |
+| PyTorch | 2.11.0 (+cu130) |
+| CUDA | 13.0 |
+| NumPy | 2.1.3 |
+| nibabel | 5.4.2 |
+| matplotlib | 3.10.0 |
+| SciPy (only for the connected-component post-processing) | 1.16.3 |
 
 **Hardware.** Google Colab, NVIDIA A100-SXM4-80GB (one 2D run on a Tesla T4). All runs use mixed precision: fp16 for 2D, bf16 for 3D.
 
@@ -136,7 +134,7 @@ The prostate label was identified **visually** (Figure 2): label 5 is the round 
 
 ### 5.2 Preprocessing
 - **2D:** slices are resized to 256×128 (only the 256×144 slices change) and z-scored per slice. Augmentation: random left–right flip only.
-- **3D:** volumes are reordered to (D, H, W) = (superior–inferior, left–right, anterior–posterior) and z-scored per volume. The final model uses the **native grid** (128×256×256, ~1.7 mm in-plane, 1.56 mm between slices). The ablation uses 128×128×128 (in-plane halved). Augmentation: random left–right flip, mild intensity scale/shift (±10%) and Gaussian noise. Preprocessed volumes are cached to disk.
+- **3D:** volumes are reordered to (D, H, W) = (superior–inferior, left–right, anterior–posterior) and z-scored per volume. The final model uses the **native grid** (128×256×256, ~1.7 mm in-plane, 1.56 mm between slices); only the single 144-slice volume is resampled to 128 slices to fit it. The ablation uses 128×128×128 (in-plane halved). Augmentation: random left–right flip, mild intensity scale/shift (±10%) and Gaussian noise. Preprocessed volumes are cached to disk.
 - **No anatomically impossible augmentation.** Vertical, superior–inferior and anterior–posterior flips and 180° rotations were removed. They would put the rectum in front of the bladder or swap base and apex, which are the structures under study.
 - **Evaluation is always at native resolution.** For the ablation model, logits are upsampled back (trilinear) before the argmax.
 
@@ -145,7 +143,7 @@ Patient-level, identical for both models:
 
 | Split | Patients | 2D slices | 3D volumes |
 |---|---|---|---|
-| Train | 31 (patients 4–35) | 11 460 | 191 |
+| Train | 31 (patients 4–35, no patient 34 in the dataset) | 11 460 | 191 |
 | Validation | 4 (36–39) | 660 | 11 |
 | Test | 3 (40–42: B040, W041, K042) | 540 | 9 |
 
@@ -158,7 +156,8 @@ The 2D dataset comes pre-split by patient, and no case ID is shared between spli
 ### 6.1 Metric definitions
 - **Global Dice:** intersections and unions summed over the whole test split, then one Dice. IoU follows exactly as IoU = Dice / (2 − Dice).
 - **Per-slice / per-volume Dice:** Dice per slice (2D, slices containing prostate) or per volume (3D), then averaged.
-- **Base / apex / inner:** in each test volume, the first and last *k* = 2 axial slices containing prostate in the ground truth are the gland's ends. The end nearer the bladder is the base, the other is the apex, and "inner" is everything in between. *Missed* = a GT slice where the model predicts no prostate at all.
+- **Base / apex / inner:** in each test volume, the first and last *k* = 2 axial slices containing prostate in the ground truth are the gland's ends. The end nearer the bladder is the base, the other is the apex, and "inner" is everything in between.
+- **Missed:** a base/apex GT slice where the model predicts no prostate at all. *Caveat:* a slice counts as detected if prostate is predicted anywhere on it, even far from the gland, so a distant false positive can hide a miss. This is why removing the 2D model's distant false positives (slab restriction, largest component) slightly *increases* its apex misses (raw 0–2 → 1–3). The slice Dice columns are not affected by this.
 - **False-positive (FP) slices:** axial slices with predicted prostate but none in the ground truth.
 
 ### 6.2 Training
@@ -194,24 +193,24 @@ The gap between global (0.87) and per-slice (0.72–0.74) Dice already shows the
 *Figure 4. 2D U-Net on 2D test slices, from the worst to the best slice Dice.*
 
 ### 6.4 Head-to-head: the same 9 test volumes
-All numbers are at native resolution. "Mean (range)" is over training seeds: three 2D runs, two 3D runs.
+All numbers are at native resolution. "Mean (range)" is over training seeds: three 2D runs, two 3D runs. Missed slices are counted out of 18 per run (9 volumes × 2 slices).
 
-| Model | Volume Dice | Base Dice | Apex Dice (missed / 18) | Inner Dice | FP slices |
-|---|---|---|---|---|---|
-| 2D U-Net, raw | 0.638 (0.351–0.838) | 0.66 (0.50–0.79) | 0.56 (0.44–0.65) (0–2) | 0.81 (0.72–0.87) | 334–857 |
-| 2D U-Net + largest component | 0.804 (0.673–0.871) | 0.721 (0.612–0.796) | 0.606 (0.472–0.674) (1–3) | 0.813 (0.682–0.881) | 30–105 |
-| 2D U-Net + 60-slice slab | 0.868 (0.866–0.870) | 0.772 (0.756–0.796) | 0.669 (0.661–0.674) (1–3) | 0.878 (0.876–0.880) | 30–33 |
-| 3D Imp. U-Net, 128×128×128 (ablation) | 0.836 | 0.682 | 0.672 (3) | 0.846 | 27 |
-| **3D Imp. U-Net, native grid** | **0.888 (0.882–0.894)** | **0.799 (0.779–0.819)** | **0.669 (0.640–0.698) (1–4)** | **0.892 (0.890–0.893)** | **20–32** |
+| Model | Volume Dice | Base Dice | Base missed | Apex Dice | Apex missed | Inner Dice | FP slices |
+|---|---|---|---|---|---|---|---|
+| 2D U-Net, raw | 0.638 (0.351–0.838) | 0.662 (0.499–0.785) | 0 | 0.559 (0.441–0.645) | 0–2 | 0.815 (0.719–0.872) | 334–857 |
+| 2D U-Net + largest component | 0.804 (0.673–0.871) | 0.721 (0.612–0.796) | 0–4 | 0.606 (0.472–0.674) | 1–3 | 0.813 (0.682–0.881) | 30–105 |
+| 2D U-Net + 60-slice slab | 0.868 (0.866–0.870) | 0.772 (0.756–0.796) | 0 | 0.669 (0.661–0.674) | 1–3 | 0.878 (0.876–0.880) | 30–33 |
+| 3D Imp. U-Net, 128×128×128 (ablation, seed 1) | 0.836 | 0.682 | 0 | 0.672 | 3 | 0.846 | 27 |
+| **3D Imp. U-Net, native grid** | **0.888 (0.882–0.894)** | **0.799 (0.779–0.819)** | **0** | **0.669 (0.640–0.698)** | **1–4** | **0.892 (0.890–0.893)** | **20–32** |
 
-*"+ largest component": keep only the largest 3D connected prostate component. "+ 60-slice slab": keep 2D predictions only inside the coronal slab the 2D dataset covers (all GT prostate lies inside it, in every volume). Adding the largest-component step to the 3D model changes nothing (0.882 → 0.882), because it already predicts one connected gland.*
+*"+ largest component": keep only the largest 3D connected prostate component. "+ 60-slice slab": keep 2D predictions only inside a fixed coronal slab [97, 157), the position of the 2D dataset's 60-slice slab as measured on B040; in every test volume it contains all of the ground-truth prostate (checked by `compare_2d_3d.py`). Adding the largest-component step to the 3D model changes nothing (0.882 → 0.882), because it already predicts one connected gland.*
 
 Per patient (raw volume Dice, 3D vs 2D), the 3D model is better for all three patients in both seed pairs, e.g. seed 1: B040 0.877 vs 0.836, K042 0.911 vs 0.845, W041 0.891 vs 0.852.
 
-**The 2D model fails outside the slab it was trained on.** Run on all 256 coronal slices of a volume, every 2D model produces false positives far from the prostate, and how many depends on the training run: 334, 429 and 857 FP slices for three runs that were indistinguishable on the 2D test set (0.866–0.873). The worst of them (T4) drops to 0.351 volume Dice. Figure 5 shows where the false positives come from: almost all of them lie in coronal slices outside the training slab, which the 2D model never saw. The largest-component step does not reliably fix this. For the T4 run, some false-positive blobs were larger than the prostate, so it kept the wrong component and deleted real prostate (4 base slices missed).
+**The 2D model fails outside the slab it was trained on.** Run on all 256 coronal slices of a volume, every 2D model produces false positives far from the prostate, and how many depends on the training run: 334, 429 and 857 FP slices for three runs that were indistinguishable on the 2D test set (0.866–0.873). The worst of them (T4) drops to 0.351 volume Dice. Figure 5 shows where the false positives come from: almost all of them lie in coronal slices outside the slab covered by the 2D dataset, which the 2D model never saw. The largest-component step does not reliably fix this. For the T4 run, some false-positive blobs were larger than the prostate, so it kept the wrong component and deleted real prostate (4 base slices missed).
 
 ![False positives along the coronal axis, T4 run](images/fp_profile_coronal_t4.png)
-*Figure 5. False-positive prostate voxels per coronal slice, summed over the 9 test volumes (log scale), for the 2D run on the T4 (blue) and the 3D model (orange). Grey: the 60-slice slab covered by the 2D dataset. Dashed: ground-truth prostate. The 2D false positives sit outside the slab. Inside it, both models only disagree with the ground truth at the gland's surface.*
+*Figure 5. False-positive prostate voxels per coronal slice, summed over the 9 test volumes (log scale), for the 2D run on the T4 (blue) and the 3D model (orange). Grey: the 60-slice slab covered by the 2D dataset ([97, 157), position measured on B040). Dashed: ground-truth prostate. The 2D false positives sit outside the slab. Inside it, both models only disagree with the ground truth at the gland's surface.*
 
 ### 6.5 Resource profile
 All numbers on an A100 80 GB. Training times are from runs that had the GPU to themselves. Inference is fp32 with batch 1 (the 2D volume timing uses chunks of 32 slices).
@@ -222,9 +221,9 @@ All numbers on an A100 80 GB. Training times are from runs that had the GPU to t
 | Training time | 9.3 min (20 epochs) | 37.9 min (early stop, best epoch 24) | 7.2 min |
 | Peak training VRAM | 1.9 GB | 14.7 GB | 3.8 GB |
 | Inference latency | 3.3 ms / slice; 283 ms / volume (256 slices); 112 ms / volume (60-slice slab) | 102 ms / volume | 30 ms / volume |
-| Peak inference VRAM | not measured | 4.2 GB | 1.3 GB |
+| Peak inference VRAM | 0.54 GB (batch 1) | 4.2 GB | 1.3 GB |
 
-The 3D model costs **4.1× the training time and 7.8× the training memory** of the 2D baseline, inside the 5–10× range the brief anticipated. Training still fits on a 16 GB GPU. At inference time it is *not* more expensive: one 3D pass (102 ms) is faster than the 2D model over all coronal slices (283 ms) and about as fast as the 2D model on the slab alone (112 ms). The 2D timing includes copying the volume to the GPU, about a few ms, which the 3D timing does not.
+The 3D model costs **4.1× the training time and 7.7× the training memory** of the 2D baseline: the memory cost is inside the 5–10× range the brief anticipated, the time cost below it. Training still fits on a 16 GB GPU. At inference time it is *not* more expensive: one 3D pass (102 ms) is faster than the 2D model over all coronal slices (283 ms) and about as fast as the 2D model on the slab alone (112 ms). Neither timing includes loading or preprocessing; the 2D volume timing additionally includes copying the volume to the GPU and the prediction back (a few ms), which the 3D timing does not.
 
 ### 6.6 Failure-case autopsies
 ![Edge slices, 2D vs 3D](images/edge_slices_2d_vs_3d_seed1.png)
@@ -244,20 +243,20 @@ The 3D model costs **4.1× the training time and 7.8× the training memory** of 
 
 ## 7. Discussion
 
-**Does 3D context fix the boundary failures?** Only partly. In the fairest comparison (the 2D model limited to its training slab, which gives it the localisation the dataset curators did by hand), the 3D model is consistently better overall: volume Dice 0.888 vs 0.868 and inner slices 0.892 vs 0.878, with no overlap between the seed ranges. At the **base** it is better on average (0.799 vs 0.772), but the seed ranges overlap. At the **apex** there is no difference at all (0.669 vs 0.669), and missed apex slices are as frequent for 3D (1–4 of 18) as for 2D (1–3). So the original hypothesis is only weakly supported at the base and not supported at the apex. Apex failures are concentrated in two single-scan patients (K042, W041) and are driven by tiny, low-contrast cross-sections against the rectum, and neither architecture solves them.
+**Does 3D context fix the boundary failures?** Only partly. In the fairest comparison (the 2D model limited to the slab covered by its training data, which gives it the localisation the dataset curators did by hand), the 3D model is consistently better overall: volume Dice 0.888 vs 0.868 and inner slices 0.892 vs 0.878, with no overlap between the seed ranges. At the **base** it is better on average (0.799 vs 0.772), but the seed ranges overlap. At the **apex** there is no difference at all (0.669 vs 0.669), and missed apex slices are as frequent for 3D (1–4 of 18) as for 2D (1–3). So the original hypothesis is only weakly supported at the base and not supported at the apex. Apex failures are concentrated in two single-scan patients (K042, W041) and are driven by tiny, low-contrast cross-sections against the rectum, and neither architecture solves them.
 
-**Context only helps if resolution is kept.** The 3D model trained on a 128×128×128 grid (3.4 mm in-plane) to save memory was *worse* than the slab-limited 2D model (0.836, base 0.682). Moving to the native grid lifted it to 0.888 (base 0.819 for the same seed). Under a memory budget, inter-slice context and in-plane resolution trade off against each other, and at the gland's ends resolution matters more.
+**Context only helps if resolution is kept.** The 3D model trained on a 128×128×128 grid (3.4 mm in-plane) to save memory was *worse* than the slab-limited 2D model (0.836, base 0.682). Moving the same seed to the native grid lifted it to 0.882 (base 0.819). Under a memory budget, inter-slice context and in-plane resolution trade off against each other, and at the gland's ends resolution matters more.
 
-**The larger difference is reliability, not accuracy.** The 2D model's good scores depend on the dataset already being cut down to 60 slices around the prostate. On a full volume, three 2D models that looked identical on the 2D test set (0.866–0.873) gave 0.351–0.838, and the size of the failure is not predictable from slice-level validation. The 3D model produces one clean gland on the full volume (20–32 FP slices, all at the gland surface), needs no post-processing, and was stable across seeds (0.882 / 0.894). This is the clearest instance of the dilemma: here an *entire evaluation protocol*, not just a global Dice, hid a failure that would appear in deployment.
+**The larger difference is reliability, not accuracy.** The 2D model's good scores depend on the dataset already being cut down to 60 slices around the prostate. On a full volume, three 2D models that looked identical on the 2D test set (0.866–0.873) gave 0.351–0.838, and the size of the failure is not predictable from slice-level validation. The 3D model produces one clean gland on the full volume (its 20–32 FP slices lie just beyond the gland's ground-truth superior/inferior ends, not in distant tissue), needs no post-processing, and was stable across seeds (0.882 / 0.894). This is the clearest instance of the dilemma: here an *entire evaluation protocol*, not just a global Dice, hid a failure that would appear in deployment.
 
 **Acceptance criteria from the feasibility review:**
 
 | # | Criterion | Result |
 |---|---|---|
 | 1 | 3D volume Dice ≥ 0.70 and not below 2D | ✅ 0.888 vs 0.868 (slab-limited 2D) |
-| 2 | Fewer missed base/apex slices than 2D, beyond seed variation | ❌ Not met: base 0 misses for both, apex 1–4 vs 1–3; higher base Dice but within seed variation |
-| 3 | No increase in false-positive slices | ✅ 20–32 vs 30–33 (slab-limited 2D) and 334–857 (raw 2D) |
-| 4 | Inference fits a 16 GB GPU; resources reported | ✅ 4.2 GB at inference (training also fits: 14.7 GB) |
+| 2 | Fewer missed base/apex slices than 2D, beyond seed variation | ❌ Not met: base 0 misses for both 3D and slab-limited 2D, apex 1–4 vs 1–3; higher base Dice but within seed variation |
+| 3 | No increase in false-positive slices | ✅ 20–32 vs 30–33 (slab-limited 2D) and 334–857 (raw 2D). The reference value of 0 in the review was measured on 2D test slices; on full volumes the comparable 2D figure is 30–33 |
+| 4 | Inference fits a 16 GB GPU; resources reported | ✅ 4.2 GB (3D) and 0.54 GB (2D) at inference; training also fits (14.7 GB) |
 | 5 | Identical patient-level split, all weeks of a patient in one split | ✅ |
 
 **Recommendation to the project manager.**
@@ -266,7 +265,7 @@ The 3D model costs **4.1× the training time and 7.8× the training memory** of 
 3. **The apex is not suitable for automated drafting**, especially where it touches the rectum, and needs mandatory human review with either model. The base is acceptable as a draft but should still be checked.
 4. **Before clinical translation,** evaluate on more test patients (3 is too few, and one dominates) and use a larger validation set so that model selection is less random.
 
-**Limitations.** Three test patients, seven of the nine test volumes from one patient. Two to three training seeds per model. A four-patient validation set (noisy model selection). Apex and base defined as the first and last two ground-truth slices. The reference contours themselves look uncertain at the gland's extremities.
+**Limitations.** Three test patients, seven of the nine test volumes from one patient. Two to three training seeds per model. A four-patient validation set (noisy model selection). Apex and base defined as the first and last two ground-truth slices, and "missed" counts any prediction on the slice as a detection (Section 6.1). The slab used for the slab-limited 2D variant was located on one patient. The reference contours themselves look uncertain at the gland's extremities.
 
 ## 8. Conclusion
 
@@ -274,7 +273,7 @@ On the HipMRI test patients, the 3D Improved U-Net segments the prostate better 
 
 ## 9. Artificial Intelligence Usage Disclosure
 
-**Tools used.** Claude (Anthropic), used through a chat interface throughout the project. *(TODO: list any other tools you used, e.g. code completion.)*
+**Tools used.** Claude (Anthropic), used through a chat interface throughout the project.
 
 **What the AI assisted with.**
 - **Code.** The initial 2D U-Net pipeline (adapted from my earlier course demo) and the first version of the 3D pipeline were largely AI-generated. During the project, Claude reviewed and rewrote the data loaders, the evaluation metrics and the 3D model (to follow Isensee et al. more closely), wrote the audit scripts, `compare_2d_3d.py`, the mixed-precision and seeding options, and the final merge of the 2D and 3D code into one package.
