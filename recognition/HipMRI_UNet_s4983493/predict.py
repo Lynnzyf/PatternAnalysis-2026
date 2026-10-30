@@ -165,6 +165,8 @@ def predict_2d(args, device):
     pred_sum = torch.zeros(NUM_CLASSES, device=device)
     gt_sum = torch.zeros(NUM_CLASSES, device=device)
     images, gts, preds, lat = [], [], [], []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     for k, (x, y) in enumerate(loader):
         x, y = x.to(device), y.to(device)
         sync(device)
@@ -192,7 +194,9 @@ def predict_2d(args, device):
              f"Prostate Dice (global, pooled over all slices): {dice[label]:.4f}",
              f"Prostate Dice (per-slice mean, prostate slices): {np.nanmean(sd[has]):.4f}",
              f"Prostate predicted on {len(fp)} of {len(ds) - len(has)} prostate-free slices",
-             f"Latency: {np.mean(lat):.2f} ms/slice (fp32, batch 1)"]
+             f"Latency: {np.mean(lat):.2f} ms/slice (fp32, batch 1)",
+             f"Peak inference VRAM: ",
+             f"{torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0.0:.2f} GB"]
     print("\n".join(lines))
     with open(os.path.join(args.save_dir, "test_results_2d.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
