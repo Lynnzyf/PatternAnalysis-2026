@@ -1,6 +1,6 @@
 # Prostate Segmentation on HipMRI: 2D U-Net vs 3D Improved U-Net
 
-**Student:** s4983493 · **Project:** 2.2 Segmentation — Prostate Radiotherapy Planning (HipMRI) · **Difficulty:** Hard (3D Improved U-Net) · **Baseline:** 2D U-Net
+**Student:** s4983493 Yifei Zhou · **Project:** 2.2 Segmentation — Prostate Radiotherapy Planning (HipMRI) · **Difficulty:** Hard (3D Improved U-Net) · **Baseline:** 2D U-Net
 
 ## 1. Problem and Algorithm
 
